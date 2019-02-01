@@ -51,6 +51,10 @@
 #include <vector>
 #include <string>
 
+#include <bitset>
+#include <iostream>
+#include <Python.h>
+
 #ifdef DEBUGGER
 #include "../debug.h"
 #endif
@@ -131,6 +135,8 @@ void S9xDetectJoypads();
 #define S9XW_SHARD_PATH SHARD_PATHA
 #endif
 
+#define DATA_SIZE 41839
+
 /*****************************************************************************/
 /* Global variables                                                          */
 /*****************************************************************************/
@@ -157,6 +163,11 @@ TCHAR multiRomA[MAX_PATH] = { 0 }; // lazy, should put in sGUI and add init to {
 TCHAR multiRomB[MAX_PATH] = { 0 };
 
 HINSTANCE g_hInst;
+
+// For AI
+ifstream fin;
+PyObject *pName, *pModule, *pStepFunc, *pInputs, *pStepArgTuple, *pValue, *pLearnFunc, *pRewards, *pLearnArgTuple;
+bool first_frame = true;
 
 #ifdef DEBUGGER
 #include "../debug.h"
@@ -3202,21 +3213,496 @@ void ControlPadFlagsToS9xPseudoPointer(uint32 p)
 		S9xReportButton(kWinCMapPseudoPtrBase + 3, (p & 0x0100) != 0);
 }
 
+
+// LOOKHERE START
+// Bunch of definitions of RAM locations
+#define ROOM_ID 0x079B
+#define EQUIPPED_ITEMS 0x09A2
+#define COLLECTED_ITEMS 0x09A4
+#define EQUIPPED_BEAMS 0x09A6
+#define COLLECTED_BEAMS 0x09A8
+#define EQUIPPED_CHARGE 0x09A7
+#define COLLECTED_CHARGE 0x09A9
+#define RESERVES_ENABLED 0x09C0
+#define HEALTH_BLOCK_START 0x09C2
+#define HEALTH_BLOCK_END 0x0A04
+#define CURRENT_POSE 0x0A1C
+#define HORIZONTAL_DIRECTION 0x0A1E
+#define VELOCITY_BLOCK_START 0x0B2C
+#define VELOCITY_BLOCK_END 0x0B4C
+#define PROJECTILES_START 0x0B64
+#define PROJECTILES_END 0x0C40
+#define TRANSITIONS_START 0x0795
+#define TRANSITIONS_END 0x079B
+#define ENEMIES_START 0x0E4E
+#define ENEMIES_END 0x0E54
+#define LIQUID_TYPE 0x195E
+#define LIQUID_HEIGHT 0x196E
+#define ROOM_WIDTH 0x07A5
+#define ROOM_HEIGHT 0x07A7
+#define ENEMY_DATA_START 0x0F78
+#define NUM_ENEMIES 0x0E4E
+#define TILE_DATA_BASE 0x10002
+#define TILE_BTS_BASE 0x16402
+#define HORIZONTAL_SPEED 0x0B42
+
+static int GetRam(int index) {
+	return int(Memory.RAM[index] + (int(Memory.RAM[index + 1]) << 8));
+}
+
+static vector<int> ParseRam() {
+	vector<int> data = vector<int>(DATA_SIZE);
+	int index = 0;
+
+	// Room ID
+	data[index] = GetRam(ROOM_ID);
+	index++;
+	// Equipped Items
+	for (int i = 0; i < 16; i++) {
+		int equipped = GetRam(EQUIPPED_ITEMS);
+		data[index] = equipped & (1 << i);
+		index++;
+	}
+	// Collected Items
+	for (int i = 0; i < 16; i++) {
+		int collected = GetRam(COLLECTED_ITEMS);
+		data[index] = (collected & (1 << i));
+		index++;
+	}
+	// Equipped Beams
+	for (int i = 0; i < 8; i++) {
+		int equipped = int(Memory.RAM[EQUIPPED_BEAMS]);
+		data[index] = (equipped & (1 << i));
+		index++;
+	}
+	// Collected Beams
+	for (int i = 0; i < 8; i++) {
+		int collected = int(Memory.RAM[COLLECTED_BEAMS]);
+		data[index] = (collected & (1 << i));
+		index++;
+	}
+	// Equipped Charge
+	data[index] = (int(Memory.RAM[EQUIPPED_CHARGE]));
+	index++;
+	// Collected Charge
+	data[index] = (int(Memory.RAM[COLLECTED_CHARGE]));
+	index++;
+	// Reserve tank mode
+	data[index] = (int(Memory.RAM[RESERVES_ENABLED]));
+	index++;
+	// Health, ammo, reserves, game time
+	for (int i = HEALTH_BLOCK_START; i < HEALTH_BLOCK_END; i+=2) {
+		data[index] = (GetRam(i));
+		index++;
+	}
+	// Pose and movement
+	data[index] = (GetRam(CURRENT_POSE));
+	index++;
+	data[index] = (int(Memory.RAM[HORIZONTAL_DIRECTION]) - 4);
+	index++;
+	// Velocity, mockball, etc.
+	for (int i = VELOCITY_BLOCK_START; i < VELOCITY_BLOCK_END; i+=2) {
+		data[index] = (GetRam(i));
+		index++;
+	}
+	// Projectiles and bombs
+	for (int i = PROJECTILES_START; i < PROJECTILES_END; i += 2) {
+		data[index] = (GetRam(i));
+		index++;
+	}
+	// Transitions
+	for (int i = TRANSITIONS_START; i < TRANSITIONS_END; i += 2) {
+		data[index] = (GetRam(i));
+		index++;
+	}
+	// Enemy metadata
+	for (int i = ENEMIES_START; i < ENEMIES_END; i += 2) {
+		data[index] = (GetRam(i));
+		index++;
+	}
+	// Liquids
+	data[index] = (GetRam(LIQUID_TYPE));
+	index++;
+	data[index] = (GetRam(LIQUID_HEIGHT));
+	index++;
+	// Room width (in tiles) (second half is unused)
+	int roomWidth = GetRam(ROOM_WIDTH);
+	data[index] = (roomWidth);
+	index++;
+	// Room height (in tiles) (second half is unused)
+	int roomHeight = GetRam(ROOM_HEIGHT);
+	data[index] = (roomHeight);
+	index++;
+	// Enemy Data
+	const int start = ENEMY_DATA_START;
+	for (int i = 0; i < 16; i++) {
+		// Used to fill empty enemies so the vector is aligned correctly
+		if (i < int(Memory.RAM[NUM_ENEMIES])) {
+			int currEnemy = start + i * 0x0040;
+			// ID and position
+			for (int j = 0; j < 14; j += 2) {
+				data[index] = (GetRam(currEnemy + j));
+				index++;
+			}
+			// HP
+			data[index] = (GetRam(currEnemy + 20));
+			index++;
+			// Frozen
+			data[index] = (GetRam(currEnemy + 38));
+			index++;
+		}
+		else {
+			// Fill an empty enemy
+			for (int i = 0; i < 9; i++) {
+				data[index] = (0);
+				index++;
+			}
+		}
+	}
+
+	// Tile data
+	for (int i = 0; i < 144; i++) {
+		for (int j = 0; j < 144; j++) {
+			// Check if tile is in bounds
+			if (i < roomHeight && j < roomWidth) {
+				int loc = TILE_DATA_BASE + (j * 2 + (i * roomWidth) * 2);
+				int value = int(Memory.RAM[loc]) + (int(Memory.RAM[loc + 1]) << 8);
+				int bts = int(Memory.RAM[TILE_BTS_BASE + j + (i * roomWidth)]);
+				if (value & 0x8000) {
+					// Solid
+					data[index] = (0);
+					index++;
+				}
+				else {
+					// Air
+					data[index] = (1);
+					index++;
+				}
+				// BTS
+				data[index] = (bts);
+				index++;
+			}
+			else {
+				// Out of bounds is just solid blocks
+				data[index] = (0);
+				index++;
+				data[index] = (0);
+				index++;
+			}
+		}
+	}
+	return data;
+}
+
+static int prevItems;
+static int prevBeams;
+static int currRoom;
+static int prevRoom;
+static int prevSpeed;
+static int prevDir;
+
+static int GetScore() {
+	// TODO: Implement scoring
+	int score = -1;
+
+	// If the game is paused (etank, xray, etc.) or transitioning rooms or on an elevator
+	if (GetRam(0x0A78) || GetRam(0x0797) || GetRam(0x0E16)) {
+		return 0;
+	}
+
+	// If we collected an item
+	if (prevItems != GetRam(COLLECTED_ITEMS) || prevBeams != GetRam(COLLECTED_BEAMS)) {
+		score += 1000;
+	}
+	prevItems = GetRam(COLLECTED_ITEMS);
+	prevBeams = GetRam(COLLECTED_BEAMS);
+
+	// When entering a new room
+	if (currRoom != GetRam(ROOM_ID)) {
+		if (prevRoom != GetRam(ROOM_ID)) {
+			score += 500;
+		}
+		else {
+			score += 50;
+		}
+		prevRoom = currRoom;
+		currRoom = GetRam(ROOM_ID);
+	}
+
+	// Punish turning around
+	// Going left
+	/*
+	if (Memory.RAM[0x0A1E] == 4) {
+		// Holding Right
+		if (GetRam(0x09B0)) {
+			score -= 4;
+		}
+	} // Going right and holding left
+	else if (GetRam(0x09AE)) {
+		score -= 4;
+	} */
+
+	// Punish slowing down/turning around
+	int speed = GetRam(HORIZONTAL_SPEED) << 16 + GetRam(HORIZONTAL_SPEED + 2);
+	if (speed < prevSpeed) {
+		score -= 4;
+	}
+	prevSpeed = speed;
+
+	// Penalty for standing still
+	if (speed < 1000) {
+		score -= 2;
+	}
+
+	// Penalty for turning around
+	if (Memory.RAM[HORIZONTAL_DIRECTION] != prevDir) {
+		score -= 2;
+	}
+	prevDir = Memory.RAM[HORIZONTAL_DIRECTION];
+
+	return score;
+}
+
+/*
+static void PrintRam() {
+	vector<int> data;
+	// Room ID
+	int room = (int(Memory.RAM[0x079C]) << 8) + int(Memory.RAM[0x079B]);
+	
+
+	// Collected items
+	cout << "items ";
+	for (int i = 0x09A2; i < 0x09A9; i++) {
+		cout << int(Memory.RAM[i]) << " ";
+	}
+	// Health, ammo, timer, reserves
+	cout << "hp ";
+	for (int i = 0x09C2; i < 0x09E5; i++) {
+		cout << int(Memory.RAM[i]) << " ";
+	}
+	// Pose and movement
+	cout << "pose ";
+	for (int i = 0x0A1C; i < 0x0A1F; i++) {
+		cout << int(Memory.RAM[i]) << " ";
+	}
+	// Grapple, spark, slowdown
+	cout << "grapple ";
+	for (int i = 0x0A64; i < 0x0A69; i++) {
+		cout << int(Memory.RAM[i]) << " ";
+	}
+	// Player location
+	cout << "location ";
+	for (int i = 0x0AF6; i < 0x0B07; i++) {
+		cout << int(Memory.RAM[i]) << " ";
+	}
+	// Nitpicky things for tricks
+	cout << "tricks ";
+	for (int i = 0x0B36; i < 0x0B4B; i++) {
+		cout << int(Memory.RAM[i]) << " ";
+	}
+	// Bombs and projectiles
+	cout << "bombProj ";
+	for (int i = 0x0B64; i < 0x0C03; i++) {
+		cout << int(Memory.RAM[i]) << " ";
+	}
+	// Charge time
+	cout << "charge ";
+	for (int i = 0x0CD0; i < 0x0CD1; i++) {
+		cout << int(Memory.RAM[i]) << " ";
+	}
+	// Elevator and doors
+	cout << "transition ";
+	for (int i = 0x0795; i < 0x079A; i++) {
+		cout << int(Memory.RAM[i]) << " ";
+	}
+	// Enemy meta
+	cout << "enemy ";
+	int numEnemies = int(Memory.RAM[0x0E4E]);
+	for (int i = 0x0E4E; i < 0x0E53; i++) {
+		cout << int(Memory.RAM[i]) << " ";
+	}
+	// Liquids
+	cout << "liquid ";
+	cout << int(Memory.RAM[0x195F]) + (int(Memory.RAM[0x195E]) << 8) << " ";
+	cout << int(Memory.RAM[0x196E]) << " " << int(Memory.RAM[0x196F]) << " ";
+
+	cout << "room ";
+	// Room ID print
+	cout << room << " ";
+	// Room width (in tiles) (second half is unused)
+	int width = int(Memory.RAM[0x07A5]);
+	cout << width << " ";
+	// Room height (in tiles) (second half is unused)
+	int height = int(Memory.RAM[0x07A7]);
+	cout << height << endl;
+
+	// Print room data
+	for (int i = 0; i < height; i++) {
+		for (int j = 0; j < width; j++) {
+			int loc = 0x10002 + (j * 2 + (i * width) * 2);
+			int value = int(Memory.RAM[loc]) + (int(Memory.RAM[loc + 1]) << 8);
+			int bts = int(Memory.RAM[0x16402 + j + (i * width)]);
+			if (bts == 0) {
+				if (value & 0x8000) {
+					cout << "S" << " ";
+				}
+				else {
+					cout << "A" << " ";
+				}
+			}
+			else {
+				cout << bts << " ";
+			}
+			//cout << std::bitset<16>(value) << " ";
+		}
+		cout << endl;
+	}
+
+	// Enemy Data
+	const int start = 0x0F78;
+	for (int i = 0; i < numEnemies; i++) {
+		int currEnemy = start + i * 0x0040;
+		cout << "Enemy " << i << ": ";
+		// ID and position
+		for (int i = 0; i < 14; i++) {
+			cout << int(Memory.RAM[currEnemy + i]) << " ";
+		}
+		// HP
+		cout << (int(Memory.RAM[currEnemy + 20])) + (int(Memory.RAM[currEnemy + 21]) << 8) << " ";
+		// Frozen
+		cout << (int(Memory.RAM[currEnemy + 38])) << endl;
+	}
+}
+*/
+
+static int framesSinceDoor = 0;
 static void ProcessInput(void)
 {
+
+	/*if (int(Memory.RAM[0x0998]) == 0x0F) {
+		PrintRam();
+	}*/
+
+	//Read inputs from user
 	extern void S9xWinScanJoypads ();
 #ifdef NETPLAY_SUPPORT
     if (!Settings.NetPlay)
 #endif
 	S9xWinScanJoypads ();
-
+	
 	extern uint32 joypads [8];
 	for(int i = 0 ; i < 8 ; i++)
 		ControlPadFlagsToS9xReportButtons(i, joypads[i]);
 
 	if (GUI.ControllerOption==SNES_JUSTIFIER_2)
 		ControlPadFlagsToS9xPseudoPointer(joypads[1]);
+	
+	// cout << GetRam(0x0B42) << " " << GetRam(0x0B44) << endl;
+
+	// Don't run before the game initializes (would cause segfault)
+	if (Memory.RAM[0] != 'U') {
+		int reward = -1;
+		if (!first_frame) {
+			reward = GetScore();
+			pRewards = PyLong_FromLong(reward);
+			PyTuple_SetItem(pLearnArgTuple, 0, pRewards);
+			PyObject_CallObject(pLearnFunc, pLearnArgTuple);
+			// Py_DECREF(pRewards);
+			// Get error message
+			if (PyErr_Occurred()) {
+				PyErr_Print();
+				cout << "Error learning" << endl;
+			}
+		}
+
+		//Send data out
+		vector<int> data = ParseRam();
+		for (int i = 0; i < data.size(); i++) {
+			pValue = PyLong_FromLong(i);
+			PyList_SetItem(pInputs, i, pValue);
+		}
+
+		pValue = PyObject_CallObject(pStepFunc, pStepArgTuple);
+
+		// Get error message
+		if (PyErr_Occurred()) {
+			PyErr_Print();
+			cout << "Error getting data" << endl;
+		}
+		
+		long output = PyLong_AsLong(pValue);
+		
+		// cout << output << endl;
+
+		s9xcommand_t cmd;
+		cmd.type = S9xButtonJoypad;
+		cmd.button.joypad.buttons = output << 4;
+		cmd.button.joypad.buttons = cmd.button.joypad.buttons & ~SNES_START_MASK;
+
+		/* LSNES file reading
+		//Get controls data
+		string line;
+		getline(fin, line);
+		if (line[7] != '.') {
+			cmd.button.joypad.buttons += SNES_B_MASK;
+		}
+		if (line[8] != '.') {
+			cmd.button.joypad.buttons += SNES_Y_MASK;
+		}
+		if (line[9] != '.') {
+			cmd.button.joypad.buttons += SNES_SELECT_MASK;
+		}
+		if (line[10] != '.') {
+			cmd.button.joypad.buttons += SNES_START_MASK;
+		}
+		if (line[11] != '.') {
+			cmd.button.joypad.buttons += SNES_UP_MASK;
+		}
+		if (line[12] != '.') {
+			cmd.button.joypad.buttons += SNES_DOWN_MASK;
+		}
+		if (line[13] != '.') {
+			cmd.button.joypad.buttons += SNES_LEFT_MASK;
+		}
+		if (line[14] != '.') {
+			cmd.button.joypad.buttons += SNES_RIGHT_MASK;
+		}
+		if (line[15] != '.') {
+			cmd.button.joypad.buttons += SNES_A_MASK;
+		}
+		if (line[16] != '.') {
+			cmd.button.joypad.buttons += SNES_X_MASK;
+		}
+		if (line[17] != '.') {
+			cmd.button.joypad.buttons += SNES_TL_MASK;
+		}
+		if (line[18] != '.') {
+			cmd.button.joypad.buttons += SNES_TR_MASK;
+		}
+		*/
+		
+
+		cmd.button.joypad.idx = 0;
+		cmd.button.joypad.sticky = 0;
+		cmd.button.joypad.toggle = 0;
+		cmd.button.joypad.turbo = 0;
+
+		S9xApplyCommand(cmd, 1, 0);
+
+		framesSinceDoor++;
+		if (reward > 0 && framesSinceDoor > 1) {
+			cmd.type = S9xButtonCommand;
+			cmd.button.command = 19;
+			S9xApplyCommand(cmd, 1, 0);
+			cout << "Took " << framesSinceDoor << " frames to reach door." << endl;
+			framesSinceDoor = 0;
+		}
+
+		first_frame = false;
+	}
 }
+
+// LOOKHERE END
 
 //static void WinDisplayString (const char *string, int linesFromBottom, int pixelsFromLeft, bool allowWrap);
 
@@ -3354,6 +3840,45 @@ int WINAPI WinMain(
 	DWORD lastTime = timeGetTime();
 
     MSG msg;
+
+	// LOOKHERE START
+
+	// Set up Python C API
+	wchar_t* wchar = Py_DecodeLocale("robotroid", nullptr);
+	wchar_t** argv = new wchar_t*[1];
+	argv[0] = wchar;
+
+	Py_Initialize();
+	PySys_SetArgv(1, argv);
+
+	PyObject *path = PySys_GetObject("path");
+	PyList_Append(path, PyUnicode_FromString("./python"));
+	// PyList_Append(path, PyUnicode_FromString("C:\\Users\\Tomek Prussak\\AppData\\Local\\Programs\\Python\\Python36\\Lib\\site-packages\\tensorflow"));
+
+	pModule = PyImport_ImportModule("robotroid");
+	
+
+	// Get error message
+	if (PyErr_Occurred()) {
+		PyErr_Print();
+		cout << "Error occurred importing module" << endl;
+	}
+
+	pStepFunc = PyObject_GetAttrString(pModule, "step");
+	pInputs = PyList_New(DATA_SIZE);
+	pStepArgTuple = PyTuple_New(1);
+	PyTuple_SetItem(pStepArgTuple, 0, pInputs);
+
+	pLearnFunc = PyObject_GetAttrString(pModule, "learn");
+	pLearnArgTuple = PyTuple_New(1);
+
+	// Get error message
+	if (PyErr_Occurred()) {
+		PyErr_Print();
+		cout << "Error occurred loading functions" << endl;
+	}
+
+	// LOOKHERE END
 
     while (TRUE)
     {
@@ -3514,6 +4039,11 @@ int WINAPI WinMain(
 loop_exit:
 
 	Settings.StopEmulation = TRUE;
+	// Clean up python and ML
+	pStepFunc = PyObject_GetAttrString(pModule, "cleanup");
+	pStepArgTuple = PyTuple_New(0);
+	PyObject_CallObject(pStepFunc, pStepArgTuple);
+
 
 	// stop sound playback
 	CloseSoundDevice();

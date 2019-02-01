@@ -24,6 +24,8 @@
 #include "netplay.h"
 #endif
 
+#include <iostream>
+
 using namespace	std;
 
 #define NONE					(-2)

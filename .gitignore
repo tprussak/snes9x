@@ -26,6 +26,7 @@ win32/BIOS
 *.smv
 *.cht
 *.rtc
+*.out
 
 
 # Included libraries in OS X that should not be ignored.
